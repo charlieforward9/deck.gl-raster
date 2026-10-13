@@ -2,6 +2,7 @@ import type { TriangleSoup } from "../layers/triangle-soup.js";
 import type { Scene } from "../scene/build-scene.js";
 import { LIBRARY_DEFAULT_MAX_ERROR } from "../scene/build-scene.js";
 import { NLCD_PIXEL_KM } from "../scene/nlcd.js";
+import type { ErrorSample } from "../scene/refinement.js";
 import type { FlightOptions, FlightPaths, FlightStyle } from "./flight.js";
 import { eastFirstDelays, flightDuration, flightPositions } from "./flight.js";
 import type {
@@ -48,6 +49,7 @@ export type StoryStepId =
   | "start"
   | "cut"
   | "first-attempt"
+  | "measure"
   | "refine"
   | "fly-over"
   | "result";
@@ -108,9 +110,19 @@ const OUTLINE: Rgba = [255, 255, 255, 110];
 const SLOTS: Rgba = [255, 255, 255, 70];
 /** Tint of the triangle about to be split. */
 const HIGHLIGHT: UnitColor = [1, 0.62, 0.04, 0.35];
+/**
+ * Tint of a triangle with the seed's error. Smaller errors are fainter, and
+ * the tint is gone at the final tolerance.
+ */
+const HEAT: UnitColor = [1, 0.27, 0.23, 0.3];
 /** Tint of the triangles a split just made. */
 const FRESH: UnitColor = [1, 0.62, 0.04, 0.2];
 const DOT_RADIUS = 7;
+const SAMPLE: Rgba = [255, 255, 255, 255];
+const SAMPLE_RADIUS = 4;
+/** Font sizes of the error labels: the worst one, and the rest. */
+const WORST_LABEL_SIZE = 22;
+const SAMPLE_LABEL_SIZE = 16;
 
 const CUT_MS = 900;
 const FIRST_SPREAD_MS = 250;
@@ -119,19 +131,24 @@ const CLEAR_MS = 500;
 const SNAP_DELAY_MS = 300;
 const SNAP_MS = 1200;
 const RESULT_MS = 1200;
+const MEASURE_POINTS_MS = 600;
+const MEASURE_GAPS_AT = 900;
+const MEASURE_WORST_AT = 2100;
+const MEASURE_MS = 3000;
 /** Refinement steps shorter than this hide their dots, to avoid flicker. */
 const DOTS_MIN_STEP_MS = 150;
 
 /**
- * The six steps of the explainer, each a pure function from time to a
+ * The seven steps of the explainer, each a pure function from time to a
  * {@link Frame}:
  *
  * 1. `start`: the source image, and the true 49°N on an empty target panel.
  * 2. `cut`: the 2-triangle seed's edges appear.
  * 3. `first-attempt`: the 2 triangles fly over; the border misses the line.
- * 4. `refine`: replay of `refine()`, on both panels in sync.
- * 5. `fly-over`: every final triangle flies into its slot.
- * 6. `result`: the edges fade, leaving the reprojected image.
+ * 4. `measure`: the test points of the seed triangles and their errors.
+ * 5. `refine`: replay of `refine()`, on both panels in sync.
+ * 6. `fly-over`: every final triangle flies into its slot.
+ * 7. `result`: the edges fade, leaving the reprojected image.
  */
 export function createStory(
   scene: Scene,
@@ -151,6 +168,21 @@ export function createStory(
   const trianglesAt = (k: number): Uint32Array =>
     k === 0 ? record.seedTriangles : record.steps[k - 1]!.triangles;
   const triangleCount = (k: number): number => trianglesAt(k).length / 3;
+  const scoresAt = (k: number): Float32Array =>
+    k === 0 ? record.seedScores : record.steps[k - 1]!.scores;
+  // Tint by error on a log scale, from full at the seed's error to clear at
+  // the final tolerance, so the tint fades as the mesh converges. Squaring
+  // it fades the tint sooner, once the largest errors are gone.
+  const heatRange = Math.log(record.seedMaxError / scene.finalMaxError);
+  const heat = (k: number, triangle: number): UnitColor => {
+    const level =
+      heatRange > 0
+        ? clamp01(
+            Math.log(scoresAt(k)[triangle]! / scene.finalMaxError) / heatRange,
+          )
+        : 0;
+    return scaleAlpha(HEAT, level * level);
+  };
   const maxErrorAt = (k: number): number =>
     k === 0 ? record.seedMaxError : record.steps[k - 1]!.maxError;
 
@@ -363,6 +395,79 @@ export function createStory(
     ];
   };
 
+  /** Test points on the slide: source dot, GPU guess, exact spot, gap. */
+  type SampleSlide = {
+    source: [number, number][];
+    guess: [number, number][];
+    exact: [number, number][];
+    gaps: [number, number][][];
+  };
+  const toSlide = (samples: ErrorSample[]): SampleSlide => {
+    const guess = samples.map((s) => layout.targetToSlide(...s.guess));
+    const exact = samples.map((s) => layout.targetToSlide(...s.exact));
+    return {
+      source: samples.map((s) => layout.uvToSource(...s.uv)),
+      guess,
+      exact,
+      gaps: guess.map((g, i) => [g, exact[i]!]),
+    };
+  };
+  const splitSampleCache = new Map<number, SampleSlide>();
+  const splitSamples = (k: number): SampleSlide => {
+    let cached = splitSampleCache.get(k);
+    if (!cached) {
+      cached = toSlide(record.steps[k]!.split.samples);
+      splitSampleCache.set(k, cached);
+    }
+    return cached;
+  };
+  /** Small dots for test points: white in the source, red guess, green exact. */
+  const sampleDots = (
+    points: SampleSlide,
+    pointsAlpha: number,
+    exactAlpha: number,
+  ): DotDraw[] => [
+    ...(pointsAlpha > 0
+      ? [
+          {
+            id: "samples-source",
+            points: points.source,
+            color: withAlpha(SAMPLE, pointsAlpha),
+            radius: SAMPLE_RADIUS,
+          },
+          {
+            id: "samples-guess",
+            points: points.guess,
+            color: withAlpha(RED, pointsAlpha),
+            radius: SAMPLE_RADIUS,
+          },
+        ]
+      : []),
+    ...(exactAlpha > 0
+      ? [
+          {
+            id: "samples-exact",
+            points: points.exact,
+            color: withAlpha(GREEN, exactAlpha),
+            radius: SAMPLE_RADIUS,
+          },
+        ]
+      : []),
+  ];
+  const sampleGaps = (points: SampleSlide, alpha: number): LineDraw[] =>
+    alpha > 0
+      ? [
+          {
+            id: "samples-gap",
+            paths: points.gaps,
+            color: withAlpha(RED, alpha),
+            width: 1.5,
+            dashed: false,
+            under: false,
+          },
+        ]
+      : [];
+
   const finalCounter = counterText(triangleCount(finalK), maxErrorAt(finalK));
   const seedErrorPx = Math.round(record.seedMaxError);
   const seedErrorKm =
@@ -438,7 +543,68 @@ export function createStory(
     },
   };
 
-  // 4. Refine
+  // 4. Measure
+  // The seed triangles share their diagonal, so drop its repeated midpoint.
+  const seedSamples = [
+    ...new Map(
+      record.seedSamples.flat().map((s) => [s.uv.join(","), s]),
+    ).values(),
+  ];
+  const seedSlide = toSlide(seedSamples);
+  const worstSample = seedSamples.reduce((a, b) => (b.error > a.error ? b : a));
+  const measure: StoryStep = {
+    id: "measure",
+    title: "Measure the error",
+    description: [
+      "To find where the distortion is highest, we test a few points in each triangle (currently its center and the middle of each edge, though this may change). At each point, we compare where the GPU draws it (red) with where it really belongs (green).",
+    ],
+    durationMs: MEASURE_MS,
+    // Starts where the first attempt ends, with the center's error showing.
+    frame: (t) => {
+      const points = easeInOutCubic(progress(t, 0, MEASURE_POINTS_MS));
+      const gaps = easeInOutCubic(progress(t, MEASURE_GAPS_AT, 600));
+      const focus = easeInOutCubic(progress(t, MEASURE_WORST_AT, 600));
+      // Once every error is in, the others step back from the worst.
+      const others = 1 - 0.25 * focus;
+      const pin = guessAt(0);
+      const errorLabels: Label[] = seedSamples.map((sample, i) => {
+        const isWorst = sample === worstSample;
+        const size = isWorst ? WORST_LABEL_SIZE : SAMPLE_LABEL_SIZE;
+        return {
+          id: `sample-error-${i}`,
+          text: `${formatPx(sample.error)} px${isWorst ? " · worst" : ""}`,
+          ...labelBeyond(seedSlide.guess[i]!, seedSlide.exact[i]!, {
+            clearance: isWorst ? 18 : 14,
+            size,
+          }),
+          color: "#ffffff",
+          opacity: gaps * (isWorst ? 1 : others),
+          size,
+        };
+      });
+      return {
+        meshes: [
+          mesh("source", soup("source", 0), SOURCE_EDGES),
+          mesh("target", soup("target", 0), TARGET_EDGES),
+        ],
+        lines: [
+          ...truthLines,
+          ...sampleGaps(seedSlide, gaps * others),
+          ...gapLine(0, 1, pin),
+        ],
+        dots: [
+          ...sampleDots(seedSlide, points * others, gaps * others),
+          ...splitDots(0, 1, pin, 0),
+        ],
+        hud: {
+          ...hud(counterText(triangleCount(0), record.seedMaxError)),
+          labels: [...labels, ...errorLabels],
+        },
+      };
+    },
+  };
+
+  // 5. Refine
   const timings = scheduleRefinement(finalK, settings.schedule);
   const refineMs = timings.length > 0 ? timings[timings.length - 1]!.end : 0;
   const refine: StoryStep = {
@@ -497,15 +663,24 @@ export function createStory(
         const fadeIn = easeInOutCubic(
           progress(t, timing.start, (timing.highlightEnd - timing.start) * 0.6),
         );
-        const tint = (triangle: number): UnitColor | null =>
-          triangle === step.split.index ? scaleAlpha(HIGHLIGHT, fadeIn) : null;
+        const tint = (triangle: number): UnitColor =>
+          triangle === step.split.index
+            ? mixUnit(heat(k, triangle), HIGHLIGHT, fadeIn)
+            : heat(k, triangle);
         return {
           meshes: [
             mesh("source", tinted(soup("source", k), k, tint), SOURCE_EDGES),
             mesh("target", tinted(soup("target", k), k, tint), TARGET_EDGES),
           ],
-          lines: [...truthLines, ...gapLine(k, dotAlpha, guess)],
-          dots: splitDots(k, dotAlpha, guess, 0),
+          lines: [
+            ...truthLines,
+            ...sampleGaps(splitSamples(k), dotAlpha),
+            ...gapLine(k, dotAlpha, guess),
+          ],
+          dots: [
+            ...sampleDots(splitSamples(k), dotAlpha, dotAlpha),
+            ...splitDots(k, dotAlpha, guess, 0),
+          ],
           hud: hud(counterText(triangleCount(k), step.split.error)),
         };
       }
@@ -524,8 +699,8 @@ export function createStory(
           lerp(guess[0], exact[0], arrived),
           lerp(guess[1], exact[1], arrived),
         ];
-        const tint = (triangle: number): UnitColor | null =>
-          fresh.has(triangle) ? FRESH : null;
+        const tint = (triangle: number): UnitColor =>
+          fresh.has(triangle) ? FRESH : heat(after, triangle);
         return {
           meshes: [
             mesh(
@@ -545,10 +720,12 @@ export function createStory(
         };
       }
 
-      // Hold: the new triangles settle and their tint fades.
+      // Hold: the new triangles are measured and take on their score's shade.
       const fade = 1 - progress(t, timing.snapEnd, timing.end - timing.snapEnd);
-      const tint = (triangle: number): UnitColor | null =>
-        fresh.has(triangle) ? scaleAlpha(FRESH, fade) : null;
+      const tint = (triangle: number): UnitColor =>
+        fresh.has(triangle)
+          ? mixUnit(heat(after, triangle), FRESH, fade)
+          : heat(after, triangle);
       const settledDot: DotDraw[] =
         dotAlpha * fade > 0
           ? [
@@ -580,7 +757,7 @@ export function createStory(
     },
   };
 
-  // 5. Fly over
+  // 6. Fly over
   const finalFlight = makeFlight(finalK, FINAL_SPREAD_MS);
   const flyOver: StoryStep = {
     id: "fly-over",
@@ -611,14 +788,16 @@ export function createStory(
     },
   };
 
-  // 6. Result
+  // 7. Result
   const result: StoryStep = {
     id: "result",
     title: "Done",
     description: [
       "That's it! The image is now projected into our target coordinate system. Finding the set of triangles, called mesh generation, is efficient and fast on the CPU. Then the hard work of resampling pixels happens on the GPU. This approach is derived from ",
       { text: "delatin", href: "https://github.com/mapbox/delatin" },
-      ", a terrain mesh generation library written by Volodymyr Agafonkin. See ",
+      ", a terrain mesh generation library written by ",
+      { text: "Volodymyr Agafonkin", href: "https://agafonkin.com/" },
+      ". See ",
       { text: "its demo", href: "https://mapbox.github.io/delatin/" },
       ` for how this process works for terrain. ${caption}`,
     ],
@@ -641,17 +820,21 @@ export function createStory(
     },
   };
 
-  return [start, cut, firstAttempt, refine, flyOver, result];
+  return [start, cut, firstAttempt, measure, refine, flyOver, result];
 }
 
 /** "N triangles · max error X px (≈ Y km)". */
 export function counterText(triangles: number, errorPx: number): string {
-  const px =
-    errorPx >= 10 ? Math.round(errorPx).toString() : errorPx.toFixed(1);
+  const px = formatPx(errorPx);
   const km = errorPx * NLCD_PIXEL_KM;
   const distance =
     km < 1 ? "< 1 km" : `≈ ${Math.round(km).toLocaleString("en-US")} km`;
   return `${triangles.toLocaleString("en-US")} triangles · max error ${px} px (${distance})`;
+}
+
+/** Whole pixels from 10 px up, one decimal below. */
+function formatPx(errorPx: number): string {
+  return errorPx >= 10 ? Math.round(errorPx).toString() : errorPx.toFixed(1);
 }
 
 /** Each edge of a triangle mesh once, as a pair of vertex ids. */
@@ -680,6 +863,43 @@ function withAlpha(color: Rgba, alpha: number): Rgba {
 /** `color` with its alpha multiplied by `alpha`. */
 function scaleAlpha(color: UnitColor, alpha: number): UnitColor {
   return [color[0], color[1], color[2], color[3] * clamp01(alpha)];
+}
+
+/**
+ * Where to put a label for the dot at `to`, so it covers neither that dot nor
+ * the line to it from `from`: just past `to`, continuing away from `from`.
+ * `clearance` is the gap to the dot's centre, and `size` the font size, both
+ * in slide units.
+ */
+function labelBeyond(
+  from: [number, number],
+  to: [number, number],
+  { clearance, size }: { clearance: number; size: number },
+): Pick<Label, "x" | "y" | "align"> {
+  const dx = to[0] - from[0];
+  const dy = to[1] - from[1];
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0
+      ? { x: to[0] + clearance, y: to[1], align: "left" }
+      : { x: to[0] - clearance, y: to[1], align: "right" };
+  }
+  // Labels are vertically centred on their anchor, so also clear half a line.
+  const offset = clearance + size * 0.6;
+  return {
+    x: to[0],
+    y: dy >= 0 ? to[1] + offset : to[1] - offset,
+    align: "center",
+  };
+}
+
+/** Linear blend between two tints. */
+function mixUnit(a: UnitColor, b: UnitColor, t: number): UnitColor {
+  return [
+    lerp(a[0], b[0], t),
+    lerp(a[1], b[1], t),
+    lerp(a[2], b[2], t),
+    lerp(a[3], b[3], t),
+  ];
 }
 
 /** Linear blend between two colours. */

@@ -12,11 +12,12 @@ const scene = buildScene({ finalMaxError: 8 });
 const story = createStory(scene, DEFAULT_STORY_SETTINGS);
 
 describe("createStory", () => {
-  it("has the six steps in order", () => {
+  it("has the seven steps in order", () => {
     expect(story.map((step) => step.id)).toEqual([
       "start",
       "cut",
       "first-attempt",
+      "measure",
       "refine",
       "fly-over",
       "result",
@@ -31,7 +32,7 @@ describe("createStory", () => {
   });
 
   it("draws every refinement phase without throwing", () => {
-    const refine = story[3]!;
+    const refine = story[4]!;
     for (let t = 0; t <= refine.durationMs; t += 37) {
       expect(() => refine.frame(t)).not.toThrow();
     }
@@ -44,6 +45,11 @@ describe("createStory", () => {
     expect(frame.meshes[0]!.edgeColor[3]).toBe(0);
   });
 
+  it("shows the image's true outline from the first step", () => {
+    const ids = story[0]!.frame(0).lines.map((line) => line.id);
+    expect(ids).toEqual(["truth-outline", "truth-parallel"]);
+  });
+
   it("ends the first attempt showing the error", () => {
     const step = story[2]!;
     const frame = step.frame(step.durationMs);
@@ -54,8 +60,58 @@ describe("createStory", () => {
     );
   });
 
-  it("ends the refinement at the final mesh", () => {
+  it("starts measuring where the first attempt ends", () => {
+    const ids = (items: { id: string }[]) => items.map((item) => item.id);
+    const end = story[2]!.frame(story[2]!.durationMs);
+    const start = story[3]!.frame(0);
+    expect(ids(start.dots)).toEqual(ids(end.dots));
+    expect(ids(start.lines)).toEqual(ids(end.lines));
+    expect(start.hud.counter).toBe(end.hud.counter);
+  });
+
+  /** The measure step's error labels, once they're all in. */
+  const errorLabels = () => {
     const step = story[3]!;
+    const frame = step.frame(step.durationMs);
+    return {
+      frame,
+      labels: frame.hud.labels.filter((l) => l.id.startsWith("sample-error")),
+    };
+  };
+
+  it("labels every distinct seed test point, the worst one largest", () => {
+    const { frame, labels } = errorLabels();
+    // 2 triangles × 4 points, minus the shared diagonal's midpoint.
+    const guesses = frame.dots.find((dot) => dot.id === "samples-guess")!;
+    expect(guesses.points).toHaveLength(7);
+    expect(labels).toHaveLength(7);
+    const worst = labels.find((l) => l.text.includes("worst"))!;
+    expect(worst.text).toBe("261 px · worst");
+    for (const label of labels) {
+      if (label !== worst) {
+        expect(label.size).toBeLessThan(worst.size!);
+      }
+    }
+  });
+
+  it("keeps each error label clear of its dot", () => {
+    const { frame, labels } = errorLabels();
+    const exact = frame.dots.find((dot) => dot.id === "samples-exact")!.points;
+    labels.forEach((label, i) => {
+      const [x, y] = exact[i]!;
+      if (label.align === "left") {
+        expect(label.x).toBeGreaterThan(x + 10);
+      } else if (label.align === "right") {
+        expect(label.x).toBeLessThan(x - 10);
+      } else {
+        // Centred labels sit above or below the dot, past half a line.
+        expect(Math.abs(label.y - y)).toBeGreaterThan(0.6 * label.size! + 10);
+      }
+    });
+  });
+
+  it("ends the refinement at the final mesh", () => {
+    const step = story[4]!;
     const frame = step.frame(step.durationMs);
     const target = frame.meshes.find((mesh) => mesh.id === "target")!;
     expect(target.soup.vertexCount / 3).toBe(100);
@@ -68,11 +124,11 @@ describe("createStory", () => {
       const flyOver = createStory(scene, {
         ...DEFAULT_STORY_SETTINGS,
         flightStyle,
-      })[4]!;
+      })[5]!;
       const flight = flyOver
         .frame(flyOver.durationMs)
         .meshes.find((mesh) => mesh.id === "flight")!;
-      const target = story[5]!
+      const target = story[6]!
         .frame(0)
         .meshes.find((mesh) => mesh.id === "target")!;
       expect(flight.soup.positions.length).toBe(target.soup.positions.length);
@@ -83,7 +139,7 @@ describe("createStory", () => {
   }
 
   it("names the library's default triangle count in the closing caption", () => {
-    const step = story[5]!;
+    const step = story[6]!;
     expect(step.frame(step.durationMs).hud.caption).toContain("6,001");
   });
 });
@@ -137,21 +193,25 @@ describe("titles and descriptions", () => {
   });
 
   it("states the threshold the refinement stopped at", () => {
-    expect(descriptionText(3)).toContain("(here 8 px)");
+    expect(descriptionText(4)).toContain("(here 8 px)");
   });
 
-  it("links to delatin and names the default triangle count", () => {
-    const runs = story[5]!.description;
+  it("links to delatin and its author, and names the default triangle count", () => {
+    const runs = story[6]!.description;
     expect(runs).toContainEqual({
       text: "delatin",
       href: "https://github.com/mapbox/delatin",
     });
-    expect(descriptionText(5)).toContain("would get 6,001 triangles");
+    expect(runs).toContainEqual({
+      text: "Volodymyr Agafonkin",
+      href: "https://agafonkin.com/",
+    });
+    expect(descriptionText(6)).toContain("would get 6,001 triangles");
   });
 });
 
 describe("refinement scrubber", () => {
-  const refine = story[3]!;
+  const refine = story[4]!;
   const scrubber = refine.scrubber!;
   const steps = scene.record.steps.length;
 
@@ -169,9 +229,18 @@ describe("refinement scrubber", () => {
     }
   });
 
-  it("shows the split's dots when paused, even on fast steps", () => {
+  it("shows the split's dots and test points when paused, even on fast steps", () => {
     const fast = scrubber.timeAt(steps - 1);
-    expect(refine.frame(fast, { paused: true }).dots.length).toBe(3);
+    expect(
+      refine.frame(fast, { paused: true }).dots.map((dot) => dot.id),
+    ).toEqual([
+      "samples-source",
+      "samples-guess",
+      "samples-exact",
+      "split-source",
+      "split-exact",
+      "split-pin",
+    ]);
     expect(refine.frame(fast).dots.length).toBe(0);
   });
 
@@ -186,6 +255,45 @@ describe("refinement scrubber", () => {
           ? scene.record.seedTriangles.length
           : scene.record.steps[position - 1]!.triangles.length;
       expect(target.soup.vertexCount).toBe(triangles);
+    }
+  });
+
+  /** The target mesh's per-vertex RGBA tints at a slider position. */
+  const tintsAt = (position: number): Float32Array =>
+    refine
+      .frame(scrubber.timeAt(position), { paused: true })
+      .meshes.find((mesh) => mesh.id === "target")!.soup.tints!;
+
+  it("tints the triangle being split orange", () => {
+    const k = 5;
+    const split = scene.record.steps[k]!.split.index;
+    // Green channel: 0.62 for orange, 0.27 for the red error tint.
+    expect(tintsAt(k)[12 * split + 1]).toBeGreaterThan(0.5);
+  });
+
+  it("fades the error tint as the mesh converges", () => {
+    // Mean tint alpha of the triangles that aren't being split.
+    const heat = (position: number) => {
+      const tints = tintsAt(position);
+      const split = scene.record.steps[position]!.split.index;
+      const alphas = Array.from(
+        { length: tints.length / 12 },
+        (_, t) => tints[12 * t + 3]!,
+      ).filter((_, t) => t !== split);
+      return alphas.reduce((sum, alpha) => sum + alpha, 0) / alphas.length;
+    };
+    // The seed triangle that isn't split first still has the seed's error.
+    expect(heat(0)).toBeCloseTo(0.3, 5);
+    expect(heat(0)).toBeGreaterThan(heat(20));
+    expect(heat(20)).toBeGreaterThan(heat(steps - 1));
+  });
+
+  it("clears the tint once the error is below the threshold", () => {
+    const tints = refine
+      .frame(refine.durationMs - 1e-6)
+      .meshes.find((mesh) => mesh.id === "target")!.soup.tints!;
+    for (let i = 3; i < tints.length; i += 4) {
+      expect(tints[i]).toBeCloseTo(0, 3);
     }
   });
 
