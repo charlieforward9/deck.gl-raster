@@ -1,5 +1,5 @@
-import type { PlanarConfiguration, Predictor } from "@cogeotiff/core";
-import { Compression, SampleFormat } from "@cogeotiff/core";
+import type { PlanarConfiguration } from "@cogeotiff/core";
+import { Compression, Predictor, SampleFormat } from "@cogeotiff/core";
 import type { RasterTypedArray } from "./array.js";
 import { decode as decodeViaCanvas } from "./codecs/canvas.js";
 import { decode as decodeDeflate } from "./codecs/deflate.js";
@@ -41,6 +41,8 @@ export type DecoderMetadata = {
   predictor: Predictor;
   planarConfiguration: PlanarConfiguration;
   lercParameters?: number[] | null;
+  /** Whether the source TIFF is little endian (`II`) rather than big endian (`MM`). */
+  littleEndian: boolean;
 };
 
 /**
@@ -115,9 +117,28 @@ export async function decode(
       bitsPerSample,
       samplesPerPixel,
       planarConfiguration,
+      littleEndian,
     } = metadata;
+    // Samples wider than one byte are stored in the file's byte order, so a big
+    // endian file must be swapped to platform order before decoding the
+    // predictor.
+    //
+    // The exception is predictor 3 (floating point predictor): its byte planes
+    // are **always** most significant byte first, regardless of the file's byte
+    // order, and applyPredictor already reassembles them in platform order.
+    const needsByteSwap =
+      !littleEndian &&
+      bitsPerSample > 8 &&
+      predictor !== Predictor.FloatingPoint;
+    let buffer = result;
+    if (needsByteSwap) {
+      if (!canSwapBytesInPlace(result, bytes)) {
+        buffer = result.slice(0);
+      }
+      swapBytesInPlace(buffer, bitsPerSample / 8);
+    }
     const predicted = applyPredictor(
-      result,
+      buffer,
       predictor,
       width,
       height,
@@ -132,6 +153,34 @@ export async function decode(
   }
 
   return result;
+}
+
+/**
+ * Whether a decoder's output buffer can be byte-swapped in place.
+ *
+ * An uncompressed decoder returns the caller's input bytes as is, and those
+ * may be shared with a block cache, so they must not be mutated. Other
+ * decoders return a fresh buffer that nothing else references.
+ */
+function canSwapBytesInPlace(
+  decoded: ArrayBuffer,
+  input: ArrayBuffer,
+): boolean {
+  return decoded !== input;
+}
+
+/**
+ * Reverse the byte order of every `bytesPerSample`-byte sample, in place.
+ */
+function swapBytesInPlace(buffer: ArrayBuffer, bytesPerSample: number): void {
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i + bytesPerSample <= bytes.length; i += bytesPerSample) {
+    for (let lo = i, hi = i + bytesPerSample - 1; lo < hi; lo++, hi--) {
+      const tmp = bytes[lo]!;
+      bytes[lo] = bytes[hi]!;
+      bytes[hi] = tmp;
+    }
+  }
 }
 
 /**
