@@ -114,6 +114,16 @@ export interface RasterLayerProps extends CompositeLayerProps {
    */
   maxError?: number;
 
+  /**
+   * Where mesh refinement measures error: in input pixels (`"input"`, the
+   * default) or output pixels (`"output"`).
+   *
+   * This is passed on to the `RasterReprojector`.
+   *
+   * @internal Experimental; may change or be removed.
+   */
+  _errorSpace?: "input" | "output";
+
   /** If set, enables debug mode for visualizing the mesh and reprojection process. */
   debug?: boolean;
 
@@ -199,7 +209,8 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
       props.height !== oldProps.height ||
       reprojectionFnsChanged ||
       props.maxError !== oldProps.maxError ||
-      props.initialTriangulation !== oldProps.initialTriangulation;
+      props.initialTriangulation !== oldProps.initialTriangulation ||
+      props._errorSpace !== oldProps._errorSpace;
 
     if (needsMeshUpdate) {
       this._generateMesh();
@@ -213,6 +224,7 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
       reprojectionFns,
       initialTriangulation,
       maxError = DEFAULT_MAX_ERROR,
+      _errorSpace,
     } = this.props;
 
     // TEMPORARY GLOBE VIEW HACK:
@@ -247,13 +259,25 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
     // To account for this, we add 1 to both width and height when generating
     // the mesh. This also solves obvious gaps in between neighboring tiles in
     // the COGLayer.
-    const reprojector = new RasterReprojector(
-      reprojectionFns,
-      width + 1,
-      height + 1,
-      { initialTriangulation },
-    );
-    reprojector.run(maxError);
+    let reprojector: RasterReprojector;
+    try {
+      reprojector = new RasterReprojector(
+        reprojectionFns,
+        width + 1,
+        height + 1,
+        { initialTriangulation, _errorSpace },
+      );
+      reprojector.run(maxError);
+    } catch (error) {
+      // Draw nothing rather than the mesh from earlier props, and report it.
+      this.setState({
+        reprojector: undefined,
+        mesh: undefined,
+        positions64Low: undefined,
+      });
+      this.raiseError(error as Error, "building the reprojection mesh");
+      return;
+    }
     const { indices, positions64High, positions64Low, texCoords } =
       reprojectorToMesh(reprojector);
 

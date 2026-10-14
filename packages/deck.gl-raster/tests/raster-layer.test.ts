@@ -1,5 +1,6 @@
 import type { ReprojectionFns } from "@developmentseed/raster-reproject";
 import { describe, expect, it, vi } from "vitest";
+import type { RasterLayerProps } from "../src/raster-layer.js";
 
 vi.mock("../src/mesh-layer/mesh-layer.js", () => ({
   MeshTextureLayer: class CapturingMeshTextureLayer {
@@ -26,13 +27,14 @@ const REPROJECTION_FNS: ReprojectionFns = {
  * object + assign, and short-circuits `getSubLayerProps` so MeshTextureLayer
  * receives the exact prop shape we hand it.
  */
-function makeBareLayer() {
+function makeBareLayer(extra: Partial<RasterLayerProps> = {}) {
   const layer = new RasterLayer({
     id: "test",
     width: 4,
     height: 4,
     reprojectionFns: REPROJECTION_FNS,
     image: {} as never,
+    ...extra,
   });
   const internalState: Record<string, unknown> = {};
   Object.assign(layer as object, { state: internalState });
@@ -160,5 +162,92 @@ describe("RasterLayer mesh fp64 split", () => {
       const highOnlyErr = Math.abs(positions[i * 3]! - vx);
       expect(highOnlyErr).toBeLessThan(2);
     }
+  });
+});
+
+describe("RasterLayer._errorSpace", () => {
+  it("passes _errorSpace to the reprojector", () => {
+    const { layer, internalState } = makeBareLayer({ _errorSpace: "output" });
+    (layer as unknown as { _generateMesh: () => void })._generateMesh();
+    const reprojector = internalState.reprojector as { _errorSpace: string };
+    expect(reprojector._errorSpace).toBe("output");
+  });
+
+  it("rebuilds the mesh when _errorSpace changes", () => {
+    const { layer } = makeBareLayer();
+    const bare = layer as unknown as {
+      props: RasterLayerProps;
+      _generateMesh: () => void;
+      updateState: (params: unknown) => void;
+    };
+    const generate = vi
+      .spyOn(bare, "_generateMesh")
+      .mockImplementation(() => {});
+    bare.updateState({
+      props: { ...bare.props, _errorSpace: "output" },
+      oldProps: { ...bare.props, _errorSpace: "input" },
+      changeFlags: {},
+    });
+    expect(generate).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the mesh when _errorSpace is unchanged", () => {
+    const { layer } = makeBareLayer({ _errorSpace: "output" });
+    const bare = layer as unknown as {
+      props: RasterLayerProps;
+      _generateMesh: () => void;
+      updateState: (params: unknown) => void;
+    };
+    const generate = vi
+      .spyOn(bare, "_generateMesh")
+      .mockImplementation(() => {});
+    bare.updateState({
+      props: { ...bare.props },
+      oldProps: { ...bare.props },
+      changeFlags: {},
+    });
+    expect(generate).not.toHaveBeenCalled();
+  });
+});
+
+describe("RasterLayer mesh errors", () => {
+  /**
+   * A layer whose mesh can't be built (output mode can't measure a pixel size
+   * where the projection doesn't move), holding a mesh from earlier props.
+   */
+  function makeFailingLayer() {
+    const { layer, internalState } = makeBareLayer({
+      reprojectionFns: { ...REPROJECTION_FNS, forwardReproject: () => [0, 0] },
+      _errorSpace: "output",
+    });
+    Object.assign(internalState, {
+      mesh: {},
+      positions64Low: new Float32Array(3),
+      reprojector: {},
+    });
+    const raiseError = vi.fn();
+    Object.assign(layer as object, { raiseError });
+    const bare = layer as unknown as {
+      _generateMesh: () => void;
+      renderLayers: () => unknown;
+    };
+    return { bare, raiseError };
+  }
+
+  it("draws nothing rather than the earlier mesh", () => {
+    const { bare } = makeFailingLayer();
+    bare._generateMesh();
+    expect(bare.renderLayers()).toBeNull();
+  });
+
+  it("reports the error through deck.gl's raiseError", () => {
+    const { bare, raiseError } = makeFailingLayer();
+    bare._generateMesh();
+    expect(raiseError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.stringContaining("_errorSpace"),
+      }),
+      "building the reprojection mesh",
+    );
   });
 });
