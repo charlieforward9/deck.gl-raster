@@ -18,6 +18,12 @@ export type HudProps = {
   title: string;
   /** Description of the step, or null when descriptions are hidden. */
   description: TextRun[] | null;
+  /** Name of the source projection, under the source panel's title. */
+  sourceName: string;
+  /** Name of the target projection, under the target panel's title. */
+  targetName: string;
+  /** Credit for the image, shown under the source panel. */
+  credit?: { text: string; href: string };
   /** Extra content laid out in slide units, such as the control bar. */
   children?: ReactNode;
 };
@@ -26,8 +32,11 @@ const TEXT_COLOR = "#e6edf3";
 const MUTED_COLOR = "#8b949e";
 const LINK_COLOR = "#58a6ff";
 
-/** Top of the description block, in slide units. */
-const DESCRIPTION_TOP = 800;
+/**
+ * Top of the description block, in slide units: clear of the counter under
+ * the map, which ends near y 803 when the map fills its panel (the Arctic).
+ */
+const DESCRIPTION_TOP = 830;
 
 /**
  * The HTML over the slide: the step title, panel titles, labels, the counter,
@@ -42,6 +51,9 @@ export function Hud({
   stepNumber,
   title,
   description,
+  sourceName,
+  targetName,
+  credit,
   children,
 }: HudProps) {
   const panelTitleY = Math.min(layout.source.y, layout.target.y) - 105;
@@ -77,26 +89,44 @@ export function Hud({
         rect={layout.source}
         y={panelTitleY}
         title="The image as stored"
-        subtitle="Albers equal-area"
+        subtitle={sourceName}
       />
       <PanelTitle
         rect={layout.target}
         y={panelTitleY}
         title="The map on screen"
-        subtitle="Web Mercator"
+        subtitle={targetName}
       />
+      {credit ? (
+        <a
+          href={credit.href}
+          target="_blank"
+          rel="noreferrer"
+          style={{
+            position: "absolute",
+            left: layout.source.x,
+            top: layout.source.y + layout.source.height + 10,
+            fontSize: 16,
+            color: MUTED_COLOR,
+            pointerEvents: "auto",
+          }}
+        >
+          {credit.text}
+        </a>
+      ) : null}
       {hud.labels.map((label) => (
         <div key={label.id} style={labelStyle(label)}>
           {label.text}
         </div>
       ))}
+      {/* One line, centred under the map: a narrow map must not wrap it. */}
       <div
         style={{
           position: "absolute",
-          left: layout.target.x,
+          left: layout.target.x + layout.target.width / 2,
           top: layout.target.y + layout.target.height + 22,
-          width: layout.target.width,
-          textAlign: "center",
+          transform: "translateX(-50%)",
+          whiteSpace: "nowrap",
           fontSize: 26,
           fontVariantNumeric: "tabular-nums",
           opacity: hud.counter ? 1 : 0,

@@ -5,18 +5,22 @@ import type { Hud as HudState } from "./animation/frame.js";
 import { Player } from "./animation/player.js";
 import type { StoryStep } from "./animation/story.js";
 import { createStory, PARALLEL_COLOR } from "./animation/story.js";
-import nlcdUrl from "./assets/nlcd-albers-2500.png";
 import { frameToLayers } from "./render/frame-to-layers.js";
 import { bakedParallel, buildScene } from "./scene/build-scene.js";
 import type { SlideFit } from "./scene/layout.js";
 import { fitSlide, SLIDE_HEIGHT, SLIDE_WIDTH } from "./scene/layout.js";
+import { scenarioById } from "./scene/scenarios.js";
 import {
   composeTexture,
   createImageTexture,
   loadImage,
 } from "./scene/texture.js";
 import type { AppSettings } from "./settings.js";
-import { DEFAULT_SETTINGS } from "./settings.js";
+import {
+  settingsFromUrl,
+  toggleErrorSpace,
+  urlWithSettings,
+} from "./settings.js";
 import { ControlBar } from "./ui/control-bar.js";
 import { Hud } from "./ui/hud.js";
 import { TuningPanel } from "./ui/tuning-panel.js";
@@ -24,7 +28,7 @@ import { TuningPanel } from "./ui/tuning-panel.js";
 /** Fill behind nodata pixels, so the whole image rectangle reads as a sheet. */
 const SHEET_COLOR = "#232a36";
 
-/** Width of the 49th parallel baked into the texture, in source pixels. */
+/** Width of the reference parallel baked into the texture, in source pixels. */
 const PARALLEL_WIDTH = 7;
 
 /** How long the controls stay up after the pointer last moved, in ms. */
@@ -122,11 +126,19 @@ export default function App() {
   const playerRef = useRef<Player | null>(null);
   const storyRef = useRef<StoryStep[] | null>(null);
   const textureRef = useRef<Texture | null>(null);
+  /** Scenario ids of the story and the texture: frames draw only when they match. */
+  const storyScenarioRef = useRef<string | null>(null);
+  const textureScenarioRef = useRef<string | null>(null);
 
   const [device, setDevice] = useState<Device | null>(null);
-  const [image, setImage] = useState<HTMLImageElement | null>(null);
+  const [image, setImage] = useState<{
+    scenarioId: string;
+    element: HTMLImageElement;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [settings, setSettings] = useState<AppSettings>(() =>
+    settingsFromUrl(window.location.search),
+  );
   const [panelOpen, setPanelOpen] = useState(false);
   const [fit, setFit] = useState(windowFit);
   const [hud, setHud] = useState<HudState>(EMPTY_HUD);
@@ -141,9 +153,23 @@ export default function App() {
   /** When a touch last revealed the hidden controls (performance.now()). */
   const touchRevealAtRef = useRef(Number.NEGATIVE_INFINITY);
 
-  const { finalMaxError, flightStyle, flightMs, arcHeight, schedule, speed } =
-    settings;
-  const scene = useMemo(() => buildScene({ finalMaxError }), [finalMaxError]);
+  const {
+    finalMaxError,
+    errorSpace,
+    flightStyle,
+    flightMs,
+    arcHeight,
+    schedule,
+    speed,
+  } = settings;
+  const scenario = useMemo(
+    () => scenarioById(settings.scenario),
+    [settings.scenario],
+  );
+  const scene = useMemo(
+    () => buildScene({ scenario, finalMaxError, errorSpace }),
+    [scenario, finalMaxError, errorSpace],
+  );
   const story = useMemo(
     () => createStory(scene, { flightStyle, flightMs, arcHeight, schedule }),
     [scene, flightStyle, flightMs, arcHeight, schedule],
@@ -192,6 +218,14 @@ export default function App() {
   useEffect(() => {
     writeDescriptions(descriptions);
   }, [descriptions]);
+
+  // Keep the scenario and metric in the address bar, so a view can be linked.
+  useEffect(() => {
+    const href = urlWithSettings(window.location.href, settings);
+    if (href !== window.location.href) {
+      window.history.replaceState(window.history.state, "", href);
+    }
+  }, [settings]);
 
   // Show the controls while the pointer moves; hide them when it rests, so
   // they stay off the projector while presenting with the keyboard.
@@ -245,10 +279,10 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    loadImage(nlcdUrl).then(
+    loadImage(scenario.imageUrl).then(
       (loaded) => {
         if (!cancelled) {
-          setImage(loaded);
+          setImage({ scenarioId: scenario.id, element: loaded });
         }
       },
       (reason: unknown) => {
@@ -260,20 +294,21 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [scenario]);
 
-  // Upload the image, with the 49th parallel baked in, once the GPU is ready.
+  // Upload the image, with its reference parallel baked in, once the GPU is
+  // ready.
   useEffect(() => {
-    if (!device || !image) {
+    if (!device || !image || image.scenarioId !== scenario.id) {
       return;
     }
     let texture: Texture;
     try {
-      const canvas = composeTexture(image, {
+      const canvas = composeTexture(image.element, {
         background: SHEET_COLOR,
         lines: [
           {
-            points: bakedParallel(),
+            points: bakedParallel(scenario),
             color: PARALLEL_COLOR,
             width: PARALLEL_WIDTH,
           },
@@ -285,14 +320,16 @@ export default function App() {
       return;
     }
     textureRef.current = texture;
+    textureScenarioRef.current = scenario.id;
     setError(null);
     return () => {
       if (textureRef.current === texture) {
         textureRef.current = null;
+        textureScenarioRef.current = null;
       }
       texture.destroy();
     };
-  }, [device, image]);
+  }, [device, image, scenario]);
 
   // A rebuilt story (after tuning) gets a new player on the same step. Steps
   // whose timing didn't change keep their place, so switching the flight
@@ -315,9 +352,10 @@ export default function App() {
       }
       playerRef.current = player;
       storyRef.current = story;
+      storyScenarioRef.current = scenario.id;
     }
     player.setSpeed(speed);
-  }, [story, speed]);
+  }, [story, speed, scenario]);
 
   // Animation loop: evaluate the current step and hand deck.gl the layers.
   useEffect(() => {
@@ -337,6 +375,10 @@ export default function App() {
       const steps = storyRef.current;
       const texture = textureRef.current;
       if (!deck || !player || !steps || !texture) {
+        return;
+      }
+      // Right after a scenario switch, the new image may still be loading.
+      if (textureScenarioRef.current !== storyScenarioRef.current) {
         return;
       }
       const index = player.stepIndex;
@@ -405,8 +447,12 @@ export default function App() {
               current.flightStyle === "direct" ? "fly-then-snap" : "direct",
           }));
           break;
-        case "h":
-        case "H":
+        case "m":
+        case "M":
+          setSettings(toggleErrorSpace);
+          break;
+        case "p":
+        case "P":
           setPanelOpen((open) => !open);
           break;
         case "d":
@@ -428,89 +474,106 @@ export default function App() {
 
   return (
     <div
-      ref={rootRef}
       style={{
         position: "fixed",
         inset: 0,
+        display: "flex",
         overflow: "hidden",
         background: "#0d1117",
       }}
     >
-      <canvas
-        ref={canvasRef}
-        style={{
-          position: "absolute",
-          inset: 0,
-          width: "100%",
-          height: "100%",
-        }}
+      <TuningPanel
+        open={panelOpen}
+        onOpenChange={setPanelOpen}
+        settings={settings}
+        onChange={setSettings}
       />
-      <Hud
-        fit={fit}
-        layout={scene.layout}
-        hud={hud}
-        stepNumber={stepIndex + 1}
-        title={currentStep.title}
-        description={descriptions ? currentStep.description : null}
+      {/* The stage: the slide is letterboxed into whatever the panel leaves. */}
+      <div
+        ref={rootRef}
+        style={{
+          position: "relative",
+          flex: 1,
+          minWidth: 0,
+          overflow: "hidden",
+        }}
       >
-        <ControlBar
-          titles={story.map((step) => step.title)}
-          stepIndex={stepIndex}
-          visible={controlsVisible}
-          descriptions={descriptions}
-          paused={paused}
-          scrubber={
-            currentStep.scrubber
-              ? {
-                  count: currentStep.scrubber.count,
-                  position: scrubPosition,
-                  label: currentStep.scrubber.label(scrubPosition),
-                }
-              : null
-          }
-          onDescriptionsChange={setDescriptions}
-          onPrevious={() => playerRef.current?.previous()}
-          onNext={() => playerRef.current?.next()}
-          onReplay={() => playerRef.current?.replay()}
-          onResume={() => playerRef.current?.resume()}
-          onJump={(index) => playerRef.current?.jumpTo(index)}
-          onScrub={(position) => {
-            const player = playerRef.current;
-            const scrubber =
-              storyRef.current?.[player?.stepIndex ?? -1]?.scrubber;
-            if (player && scrubber) {
-              player.seek(scrubber.timeAt(position));
-            }
-          }}
-          onHoverChange={(hovering) => {
-            hoveringControlsRef.current = hovering;
-            if (!hovering) {
-              // Restart the idle timer: hover can end without a pointermove,
-              // e.g. when a slider drag is released off the bar.
-              showControlsRef.current?.();
-            }
-          }}
-          shouldIgnoreClick={() =>
-            performance.now() - touchRevealAtRef.current < TOUCH_REVEAL_MS
-          }
-        />
-      </Hud>
-      {error ? (
-        <div
+        <canvas
+          ref={canvasRef}
           style={{
             position: "absolute",
-            left: 20,
-            bottom: 20,
-            color: "#ff7b72",
-            fontSize: 16,
+            inset: 0,
+            width: "100%",
+            height: "100%",
           }}
+        />
+        <Hud
+          fit={fit}
+          layout={scene.layout}
+          hud={hud}
+          stepNumber={stepIndex + 1}
+          title={currentStep.title}
+          description={descriptions ? currentStep.description : null}
+          sourceName={scenario.sourceName}
+          targetName={scenario.targetName}
+          credit={scenario.credit}
         >
-          {error}
-        </div>
-      ) : null}
-      {panelOpen ? (
-        <TuningPanel settings={settings} onChange={setSettings} />
-      ) : null}
+          <ControlBar
+            titles={story.map((step) => step.title)}
+            stepIndex={stepIndex}
+            visible={controlsVisible}
+            descriptions={descriptions}
+            paused={paused}
+            scrubber={
+              currentStep.scrubber
+                ? {
+                    count: currentStep.scrubber.count,
+                    position: scrubPosition,
+                    label: currentStep.scrubber.label(scrubPosition),
+                  }
+                : null
+            }
+            onDescriptionsChange={setDescriptions}
+            onPrevious={() => playerRef.current?.previous()}
+            onNext={() => playerRef.current?.next()}
+            onReplay={() => playerRef.current?.replay()}
+            onResume={() => playerRef.current?.resume()}
+            onJump={(index) => playerRef.current?.jumpTo(index)}
+            onScrub={(position) => {
+              const player = playerRef.current;
+              const scrubber =
+                storyRef.current?.[player?.stepIndex ?? -1]?.scrubber;
+              if (player && scrubber) {
+                player.seek(scrubber.timeAt(position));
+              }
+            }}
+            onHoverChange={(hovering) => {
+              hoveringControlsRef.current = hovering;
+              if (!hovering) {
+                // Restart the idle timer: hover can end without a pointermove,
+                // e.g. when a slider drag is released off the bar.
+                showControlsRef.current?.();
+              }
+            }}
+            shouldIgnoreClick={() =>
+              performance.now() - touchRevealAtRef.current < TOUCH_REVEAL_MS
+            }
+          />
+        </Hud>
+        {error ? (
+          <div
+            style={{
+              position: "absolute",
+              left: 20,
+              bottom: 20,
+              color: "#ff7b72",
+              fontSize: 16,
+            }}
+          >
+            {error}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }

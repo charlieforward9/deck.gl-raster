@@ -1,10 +1,4 @@
-import {
-  albersToPixel,
-  albersToWebMercator,
-  lngLatToAlbers,
-  lngLatToWebMercator,
-  pixelToAlbers,
-} from "./nlcd.js";
+import type { ReprojectionFns } from "@developmentseed/raster-reproject";
 
 /** A polyline as a list of `[x, y]` points. */
 export type Polyline = [number, number][];
@@ -12,36 +6,34 @@ export type Polyline = [number, number][];
 /** Bounding box `[minX, minY, maxX, maxY]`. */
 export type Bounds = [number, number, number, number];
 
-/** A parallel (constant latitude) in the source image's pixel coordinates. */
-export function parallelInPixels(
-  lat: number,
-  lngRange: [number, number],
-  samples = 129,
-): Polyline {
-  return sampleRange(lngRange, samples).map((lng) =>
-    albersToPixel(...lngLatToAlbers(lng, lat)),
-  );
-}
+/**
+ * Points per image edge: one count for all four, or one per edge in
+ * `[top, right, bottom, left]` order.
+ */
+export type EdgeSamples = number | [number, number, number, number];
 
-/** A parallel (constant latitude) in Web Mercator metres. */
-export function parallelInWebMercator(
+/**
+ * A parallel (constant latitude) across `lngRange`, with each point mapped by
+ * `project` from longitude, latitude (degrees) into the wanted coordinates.
+ */
+export function parallelPolyline(
+  project: (lng: number, lat: number) => [number, number],
   lat: number,
   lngRange: [number, number],
   samples = 129,
 ): Polyline {
-  return sampleRange(lngRange, samples).map((lng) =>
-    lngLatToWebMercator(lng, lat),
-  );
+  return sampleRange(lngRange, samples).map((lng) => project(lng, lat));
 }
 
 /**
  * The image's outline as a closed ring in pixel coordinates, clockwise from
- * the top-left corner, with `samplesPerEdge` points per edge.
+ * the top-left corner, with `samplesPerEdge` points per edge: one count for
+ * every edge, or one per edge in `[top, right, bottom, left]` order.
  */
 export function imageOutlineInPixels(
   width: number,
   height: number,
-  samplesPerEdge = 64,
+  samplesPerEdge: EdgeSamples = 64,
 ): Polyline {
   const corners: [number, number][] = [
     [0, 0],
@@ -53,8 +45,10 @@ export function imageOutlineInPixels(
   for (let i = 0; i < 4; i++) {
     const [x0, y0] = corners[i]!;
     const [x1, y1] = corners[(i + 1) % 4]!;
-    for (let s = 0; s < samplesPerEdge; s++) {
-      const t = s / samplesPerEdge;
+    const samples =
+      typeof samplesPerEdge === "number" ? samplesPerEdge : samplesPerEdge[i]!;
+    for (let s = 0; s < samples; s++) {
+      const t = s / samples;
       ring.push([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t]);
     }
   }
@@ -62,14 +56,15 @@ export function imageOutlineInPixels(
   return ring;
 }
 
-/** The image's outline reprojected to Web Mercator metres. */
-export function imageOutlineInWebMercator(
+/** The image's outline reprojected to the target CRS. */
+export function imageOutlineInTarget(
+  fns: ReprojectionFns,
   width: number,
   height: number,
-  samplesPerEdge = 64,
+  samplesPerEdge: EdgeSamples = 64,
 ): Polyline {
   return imageOutlineInPixels(width, height, samplesPerEdge).map(([x, y]) =>
-    albersToWebMercator(...pixelToAlbers(x, y)),
+    fns.forwardReproject(...fns.forwardTransform(x, y)),
   );
 }
 
