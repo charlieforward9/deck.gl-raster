@@ -12,9 +12,12 @@ import type {
   ReprojectionFns,
 } from "@developmentseed/raster-reproject";
 import { RasterReprojector } from "@developmentseed/raster-reproject";
+import type { Mesh2D } from "./clip-mesh-to-world.js";
+import { clipMeshToWorld } from "./clip-mesh-to-world.js";
 import { splitFloat64Array } from "./fp64.js";
 import { buildUniformGridMesh } from "./globe-grid-mesh.js";
 import type { RasterModule } from "./gpu-modules/types.js";
+import { makeUnwrappedReprojectionFns } from "./make-unwrapped-reprojection-fns.js";
 import { MeshTextureLayer } from "./mesh-layer/mesh-layer.js";
 
 const DEFAULT_MAX_ERROR = 0.125;
@@ -45,7 +48,9 @@ const DEBUG_COLORS: [number, number, number][] = [
 ];
 
 type DebugData = {
-  reprojector: RasterReprojector;
+  indices: Uint32Array;
+  positions64High: Float32Array;
+  positions64Low: Float32Array;
   length: number;
 };
 
@@ -123,6 +128,18 @@ export interface RasterLayerProps extends CompositeLayerProps {
    * @internal Experimental; may change or be removed.
    */
   _errorSpace?: "input" | "output";
+
+  /**
+   * The period of the output's x axis, if it wraps around: one world width
+   * (512) for Web Mercator in deck.gl's common space.
+   *
+   * An image that crosses the wrap (the antimeridian) is then meshed in one
+   * piece, the short way across, and drawn cut at the world's edge, each part
+   * inside the world. Needs `_errorSpace: "output"`.
+   *
+   * @internal Experimental; may change or be removed.
+   */
+  _wrapX?: number;
 
   /** If set, enables debug mode for visualizing the mesh and reprojection process. */
   debug?: boolean;
@@ -210,7 +227,8 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
       reprojectionFnsChanged ||
       props.maxError !== oldProps.maxError ||
       props.initialTriangulation !== oldProps.initialTriangulation ||
-      props._errorSpace !== oldProps._errorSpace;
+      props._errorSpace !== oldProps._errorSpace ||
+      props._wrapX !== oldProps._wrapX;
 
     if (needsMeshUpdate) {
       this._generateMesh();
@@ -225,6 +243,7 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
       initialTriangulation,
       maxError = DEFAULT_MAX_ERROR,
       _errorSpace,
+      _wrapX,
     } = this.props;
 
     // TEMPORARY GLOBE VIEW HACK:
@@ -261,12 +280,25 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
     // the COGLayer.
     let reprojector: RasterReprojector;
     try {
-      reprojector = new RasterReprojector(
-        reprojectionFns,
-        width + 1,
-        height + 1,
-        { initialTriangulation, _errorSpace },
-      );
+      if (_wrapX !== undefined && _errorSpace !== "output") {
+        throw new Error('RasterLayer: _wrapX needs _errorSpace: "output".');
+      }
+
+      // When `_wrapX` is defined, make the projection continuous across the
+      // wrap, so the reprojector meshes an image that crosses it in one piece.
+      const fns =
+        _wrapX === undefined
+          ? reprojectionFns
+          : makeUnwrappedReprojectionFns(reprojectionFns, {
+              width,
+              height,
+              period: _wrapX,
+            });
+
+      reprojector = new RasterReprojector(fns, width + 1, height + 1, {
+        initialTriangulation,
+        _errorSpace,
+      });
       reprojector.run(maxError);
     } catch (error) {
       // Draw nothing rather than the mesh from earlier props, and report it.
@@ -278,8 +310,20 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
       this.raiseError(error as Error, "building the reprojection mesh");
       return;
     }
+    const reprojected: Mesh2D = {
+      positions: reprojector.exactOutputPositions,
+      uvs: reprojector.uvs,
+      triangles: reprojector.triangles,
+    };
+
+    // When `_wrapX` is set, the mesh may run past the world's edge.
+    //
+    // We need to cut it on the world's edge, so each part is drawn inside the
+    // correct world.
+    const drawnMesh =
+      _wrapX === undefined ? reprojected : clipMeshToWorld(reprojected, _wrapX);
     const { indices, positions64High, positions64Low, texCoords } =
-      reprojectorToMesh(reprojector);
+      meshToBuffers(drawnMesh);
 
     this.setState({
       reprojector,
@@ -295,19 +339,25 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
   }
 
   renderDebugLayer(): Layer | null {
-    const { reprojector } = this.state;
+    const { mesh, positions64Low } = this.state;
     const { debugOpacity } = this.props;
 
-    if (!reprojector) {
+    if (!mesh || !positions64Low) {
       return null;
     }
 
+    const indices = mesh.indices.value;
     return new PolygonLayer(
       this.getSubLayerProps({
         id: "polygon",
         // https://deck.gl/docs/developer-guide/performance#supply-binary-blobs-to-the-data-prop
         // This `data` gets passed into `getPolygon` with the row index.
-        data: { reprojector, length: reprojector.triangles.length / 3 },
+        data: {
+          indices,
+          positions64High: mesh.attributes.POSITION.value,
+          positions64Low,
+          length: indices.length / 3,
+        },
         getPolygon: (
           _: any,
           {
@@ -318,19 +368,18 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
             data: DebugData;
           },
         ) => {
-          const triangles = data.reprojector.triangles;
-          const positions = reprojector.exactOutputPositions;
+          const { indices, positions64High: high, positions64Low: low } = data;
 
-          const a = triangles[index * 3]!;
-          const b = triangles[index * 3 + 1]!;
-          const c = triangles[index * 3 + 2]!;
+          const a = indices[index * 3]!;
+          const b = indices[index * 3 + 1]!;
+          const c = indices[index * 3 + 2]!;
 
-          return [
-            [positions[a * 2]!, positions[a * 2 + 1]!],
-            [positions[b * 2]!, positions[b * 2 + 1]!],
-            [positions[c * 2]!, positions[c * 2 + 1]!],
-            [positions[a * 2]!, positions[a * 2 + 1]!],
+          // Recombine float32 high and low parts to get position
+          const position = (vertex: number): [number, number] => [
+            high[vertex * 3]! + low[vertex * 3]!,
+            high[vertex * 3 + 1]! + low[vertex * 3 + 1]!,
           ];
+          return [position(a), position(b), position(c), position(a)];
         },
         getFillColor: (
           _: any,
@@ -393,19 +442,19 @@ export class RasterLayer extends CompositeLayer<RasterLayerProps> {
   }
 }
 
-function reprojectorToMesh(reprojector: RasterReprojector): {
+function meshToBuffers(mesh: Mesh2D): {
   indices: Uint32Array;
   positions64High: Float32Array;
   positions64Low: Float32Array;
   texCoords: Float32Array;
 } {
-  const numVertices = reprojector.uvs.length / 2;
-  const texCoords = new Float32Array(reprojector.uvs);
+  const numVertices = mesh.uvs.length / 2;
+  const texCoords = new Float32Array(mesh.uvs);
 
   const positions = new Float64Array(numVertices * 3);
   for (let i = 0; i < numVertices; i++) {
-    positions[i * 3] = reprojector.exactOutputPositions[i * 2]!;
-    positions[i * 3 + 1] = reprojector.exactOutputPositions[i * 2 + 1]!;
+    positions[i * 3] = mesh.positions[i * 2]!;
+    positions[i * 3 + 1] = mesh.positions[i * 2 + 1]!;
     // z (flat on the ground)
     positions[i * 3 + 2] = 0;
   }
@@ -415,7 +464,7 @@ function reprojectorToMesh(reprojector: RasterReprojector): {
   const [positions64Low, positions64High] = splitFloat64Array(positions);
 
   // TODO: Consider using 16-bit indices if the mesh is small enough
-  const indices = new Uint32Array(reprojector.triangles);
+  const indices = new Uint32Array(mesh.triangles);
 
   return {
     indices,
