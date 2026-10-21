@@ -206,6 +206,26 @@ export class RasterTileset2D extends Tileset2D {
   }
 
   /**
+   * Unloads every cached tile. deck.gl's `Tileset2D.finalize` clears its cache
+   * without calling `onTileUnload`, so GPU resources that `getTileData` made
+   * for those tiles, like textures, would be freed only by garbage collection.
+   * A tile still loading is unloaded once its load finishes, since deck.gl
+   * keeps the data that `getTileData` returns after an abort.
+   */
+  override finalize(): void {
+    const { onTileUnload } = this.opts;
+    for (const tile of this.tiles) {
+      if (tile.isLoading) {
+        // `data` is a promise until the load finishes.
+        void Promise.resolve(tile.data).then(() => onTileUnload(tile));
+      } else {
+        onTileUnload(tile);
+      }
+    }
+    super.finalize();
+  }
+
+  /**
    * Get tile indices visible in viewport
    * Uses frustum culling similar to OSM implementation
    *
