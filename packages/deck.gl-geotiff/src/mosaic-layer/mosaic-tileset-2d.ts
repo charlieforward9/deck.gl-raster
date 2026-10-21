@@ -7,7 +7,7 @@ import type {
 import { _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
 import type { Bounds } from "@developmentseed/deck.gl-raster";
 import { nearestCopy } from "@developmentseed/proj";
-import type Flatbush from "flatbush";
+import Flatbush from "flatbush";
 
 /** Tile index.
  *
@@ -29,9 +29,25 @@ export type MosaicSource = {
    */
   id?: string;
   /**
-   * Geographic bounds (WGS84) of the source in [minX, minY, maxX, maxY] format
+   * Geographic bounds (WGS84) of the source in [minX, minY, maxX, maxY] format.
+   *
+   * A bbox across the antimeridian may be written with `minX > maxX`, as
+   * GeoJSON (RFC 7946 section 5.2) and STAC do.
    */
   bbox: [number, number, number, number];
+};
+
+/**
+ * The spatial index of a mosaic's sources.
+ *
+ * A source whose bbox crosses the antimeridian is indexed as two boxes, one on
+ * each side, so `boxToSource` maps each box back to its source.
+ */
+export type SourceIndex = {
+  /** Flatbush index of the sources' boxes. */
+  boxes: Flatbush;
+  /** For each box in `boxes`, the position of its source in `sources`. */
+  boxToSource: Uint32Array;
 };
 
 /**
@@ -58,11 +74,11 @@ export class MosaicTileset2D<MosaicT extends MosaicSource> extends Tileset2D {
   private getSources: () => MosaicT[];
 
   /** Access the spatial index on the MosaicLayer instance. */
-  private getIndex: () => Flatbush | null;
+  private getIndex: () => SourceIndex | null;
 
   constructor(
     getSources: () => MosaicT[],
-    getIndex: () => Flatbush | null,
+    getIndex: () => SourceIndex | null,
     opts: Tileset2DProps,
   ) {
     super(opts);
@@ -86,14 +102,15 @@ export class MosaicTileset2D<MosaicT extends MosaicSource> extends Tileset2D {
    * Must override because our tileIndex does not have x, y, z.
    *
    * The bbox is returned as a {@link GeoBoundingBox} object to satisfy deck.gl
-   * requirements for center-first tile loading.
+   * requirements for center-first tile loading. deck.gl expects west < east,
+   * so a bbox across the antimeridian gets its east edge one world east.
    */
   override getTileMetadata(tileIndex: TileIndex): {
     id: string;
     bbox: GeoBoundingBox;
   } {
     const { id, bbox } = tileIndex as unknown as ResolvedSource<MosaicT>;
-    const [west, south, east, north] = bbox;
+    const [west, south, east, north] = unwrapBbox(bbox);
     return { id, bbox: { west, south, east, north } };
   }
 
@@ -122,11 +139,12 @@ export class MosaicTileset2D<MosaicT extends MosaicSource> extends Tileset2D {
       return [];
     }
 
-    // A source can match both halves of bounds split at the antimeridian.
+    // A source can match more than once, since bounds and bboxes across the
+    // antimeridian are both split in two.
     const matched = new Set<number>();
     for (const bounds of searchBounds(viewport)) {
-      for (const i of index.search(...bounds)) {
-        matched.add(i);
+      for (const box of index.boxes.search(...bounds)) {
+        matched.add(index.boxToSource[box]!);
       }
     }
     let indices = [...matched];
@@ -135,7 +153,7 @@ export class MosaicTileset2D<MosaicT extends MosaicSource> extends Tileset2D {
     // Read `extent` on every call: TileLayer updates it through `setOptions`.
     const extent = this.opts.extent as Bounds | null;
     if (extent) {
-      indices = indices.filter((i) => overlaps(sources[i]!.bbox, extent));
+      indices = indices.filter((i) => overlapsExtent(sources[i]!.bbox, extent));
     }
 
     return indices.map((sourceIndex) => {
@@ -151,6 +169,55 @@ export class MosaicTileset2D<MosaicT extends MosaicSource> extends Tileset2D {
       };
     });
   }
+}
+
+/**
+ * Index the bboxes of `sources`, or return `null` when there are none.
+ */
+export function buildSourceIndex(sources: MosaicSource[]): SourceIndex | null {
+  if (sources.length === 0) {
+    return null;
+  }
+
+  const splitBboxes = sources.map((source) =>
+    splitAtAntimeridian(unwrapBbox(source.bbox)),
+  );
+  const numBoxes = splitBboxes.reduce((sum, split) => sum + split.length, 0);
+  const boxes = new Flatbush(numBoxes);
+  const boxToSource = new Uint32Array(numBoxes);
+  splitBboxes.forEach((split, sourceIndex) => {
+    for (const box of split) {
+      const boxIndex = boxes.add(...box);
+      boxToSource[boxIndex] = sourceIndex;
+    }
+  });
+  boxes.finish();
+  return { boxes, boxToSource };
+}
+
+/**
+ * Move the east edge of a bbox across the antimeridian, written with
+ * `minX > maxX`, one world east: then `minX < maxX`, and `maxX` runs past
+ * 180°. Any other bbox keeps its edges.
+ */
+export function unwrapBbox(bbox: Readonly<Bounds>): Bounds {
+  const [minX, minY, maxX, maxY] = bbox;
+  return [minX, minY, minX > maxX ? maxX + 360 : maxX, maxY];
+}
+
+/**
+ * Split bounds whose east edge may run past 180° into bounds within
+ * [-180, 180]: two, if they cross the antimeridian.
+ */
+function splitAtAntimeridian(bounds: Bounds): Bounds[] {
+  const [minX, minY, maxX, maxY] = bounds;
+  if (maxX <= 180) {
+    return [bounds];
+  }
+  return [
+    [minX, minY, 180, maxY],
+    [-180, minY, maxX - 360, maxY],
+  ];
 }
 
 /**
@@ -173,14 +240,21 @@ function searchBounds(viewport: Viewport): Bounds[] {
     return [[-180, minY, 180, maxY]];
   }
   const west = nearestCopy(minX, 0, 360);
-  const east = west + (maxX - minX);
-  if (east <= 180) {
-    return [[west, minY, east, maxY]];
+  return splitAtAntimeridian([west, minY, west + (maxX - minX), maxY]);
+}
+
+/**
+ * Whether a source's bbox overlaps `extent`. A bbox across the antimeridian is
+ * split first, so each side is tested on its own; any other bbox is tested
+ * without allocating, since this runs for each matched source on every call.
+ */
+function overlapsExtent(bbox: Bounds, extent: Bounds): boolean {
+  if (bbox[0] <= bbox[2]) {
+    return overlaps(bbox, extent);
   }
-  return [
-    [west, minY, 180, maxY],
-    [-180, minY, east - 360, maxY],
-  ];
+  return splitAtAntimeridian(unwrapBbox(bbox)).some((box) =>
+    overlaps(box, extent),
+  );
 }
 
 /**
