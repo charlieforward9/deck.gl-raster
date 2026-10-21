@@ -355,6 +355,10 @@ export class RasterTileLayer<
     // `Deck.useDevicePixels`). The drawing-buffer ratio is the
     // *effective* DPR Deck is rendering at.
     const device = this.context.device;
+    // It's important for `TilesetFactory` to be a new class on every call
+    // because deck.gl compares `TilesetClass` by identity: the new class makes
+    // the inner `TileLayer` re-render loaded tiles with the current props.
+    // See #710.
     class TilesetFactory extends RasterTileset2D {
       constructor(opts: Tileset2DProps) {
         super(opts, descriptor, {
