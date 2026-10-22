@@ -43,16 +43,20 @@ export class WorkerWrapper {
   readonly worker: Worker;
   private jobIdCounter = 0;
   private jobs = new Map<number, PendingJob>();
+  /** Set once the worker fails; every later job is rejected with it. */
+  private error: Error | null = null;
 
   constructor(worker: Worker) {
     this.worker = worker;
     this.worker.addEventListener("message", (e: MessageEvent) =>
       this.onMessage(e),
     );
+    this.worker.addEventListener("error", (e: ErrorEvent) => this.onError(e));
   }
 
   get jobCount(): number {
-    return this.jobs.size;
+    // A failed worker is never the least loaded while a working one remains.
+    return this.error ? Infinity : this.jobs.size;
   }
 
   private onMessage(
@@ -72,10 +76,30 @@ export class WorkerWrapper {
     }
   }
 
+  /**
+   * A worker whose script fails to load, or that throws outside a job, fires
+   * `error` instead of replying, so its pending jobs would never settle.
+   */
+  private onError(e: ErrorEvent): void {
+    // A failed script load fires a plain `Event`, which has no message.
+    this.error = new Error(
+      e.message
+        ? `Decoder worker failed: ${e.message}`
+        : "Decoder worker failed",
+    );
+    for (const job of this.jobs.values()) {
+      job.reject(this.error);
+    }
+    this.jobs.clear();
+  }
+
   submitJob(
     request: Omit<WorkerRequest, "jobId">,
     transferables: Transferable[],
   ): Promise<DecodedPixels> {
+    if (this.error) {
+      return Promise.reject(this.error);
+    }
     const jobId = this.jobIdCounter++;
     return new Promise((resolve, reject) => {
       this.jobs.set(jobId, { resolve, reject });
