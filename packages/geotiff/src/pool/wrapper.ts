@@ -54,8 +54,12 @@ export class WorkerWrapper {
     this.worker.addEventListener("error", (e: ErrorEvent) => this.onError(e));
   }
 
+  /**
+   * How many jobs are waiting on this worker. `DecoderPool` sends each decode
+   * to the worker with the fewest. A failed worker reports `Infinity`, so it
+   * is picked only when every worker has failed, and `submitJob` then rejects.
+   */
   get jobCount(): number {
-    // A failed worker is never the least loaded while a working one remains.
     return this.error ? Infinity : this.jobs.size;
   }
 
