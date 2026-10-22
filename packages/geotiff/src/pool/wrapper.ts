@@ -89,12 +89,14 @@ export class WorkerWrapper {
     this.error = new Error(
       e.message
         ? `Decoder worker failed: ${e.message}`
-        : "Decoder worker failed",
+        : "Decoder worker failed to load",
     );
     for (const job of this.jobs.values()) {
       job.reject(this.error);
     }
     this.jobs.clear();
+    // An uncaught error can leave the worker running, but it gets no more jobs.
+    this.worker.terminate();
   }
 
   submitJob(

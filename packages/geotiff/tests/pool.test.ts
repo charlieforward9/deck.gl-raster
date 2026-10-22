@@ -22,10 +22,13 @@ const metadata: DecoderMetadata = {
 /** A worker that never replies, so only its events settle a decode. */
 class SilentWorker extends EventTarget {
   posted = 0;
+  terminated = false;
   postMessage(): void {
     this.posted++;
   }
-  terminate(): void {}
+  terminate(): void {
+    this.terminated = true;
+  }
 }
 
 /** A single-worker pool whose worker the test controls. */
@@ -57,7 +60,14 @@ describe("DecoderPool", () => {
     worker.dispatchEvent(new Event("error"));
     await expect(
       pool.decode(new ArrayBuffer(1), Compression.None, metadata),
-    ).rejects.toThrow("Decoder worker failed");
+    ).rejects.toThrow("Decoder worker failed to load");
+  });
+
+  it("terminates a worker once it fails", () => {
+    const { worker } = silentPool();
+    // An uncaught error doesn't stop a worker by itself.
+    worker.dispatchEvent(new ErrorEvent("error", { message: "boom" }));
+    expect(worker.terminated).toBe(true);
   });
 
   it("sends decodes to a working worker once another has failed", () => {
